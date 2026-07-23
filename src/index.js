@@ -20,24 +20,89 @@ const client = new Client({
 
 const commandDefinition = new SlashCommandBuilder()
   .setName("getlistofmapqueued")
-  .setDescription("Read all osu links in this channel and output one deduplicated file.");
+  .setDescription("Read all osu links in this channel and output unique beatmapset IDs.");
 
-function extractOsuLinksFromText(text) {
+function extractOsuReferencesFromText(text) {
   if (!text) {
-    return [];
+    return {
+      beatmapsetIds: new Set(),
+      beatmapIdsToResolve: new Set()
+    };
   }
 
   const urlRegex = /https?:\/\/[\w.-]+\S*/gi;
   const allUrls = text.match(urlRegex) || [];
 
-  return allUrls.filter((url) => {
-    const normalized = url.replace(/[)>.,!?]+$/g, "");
-    return /https?:\/\/(?:osu\.ppy\.sh|old\.ppy\.sh)\//i.test(normalized);
-  }).map((url) => url.replace(/[)>.,!?]+$/g, ""));
+  const beatmapsetIds = new Set();
+  const beatmapIdsToResolve = new Set();
+
+  for (const rawUrl of allUrls) {
+    const normalized = rawUrl.replace(/[)>.,!?]+$/g, "");
+
+    let parsed;
+    try {
+      parsed = new URL(normalized);
+    } catch {
+      continue;
+    }
+
+    if (!/^(?:osu\.ppy\.sh|old\.ppy\.sh)$/i.test(parsed.hostname)) {
+      continue;
+    }
+
+    const beatmapsetsMatch = parsed.pathname.match(/^\/beatmapsets\/(\d+)/i);
+    if (beatmapsetsMatch) {
+      beatmapsetIds.add(beatmapsetsMatch[1]);
+      continue;
+    }
+
+    const shortSetMatch = parsed.pathname.match(/^\/s\/(\d+)/i);
+    if (shortSetMatch) {
+      beatmapsetIds.add(shortSetMatch[1]);
+      continue;
+    }
+
+    const shortBeatmapMatch = parsed.pathname.match(/^\/b\/(\d+)/i);
+    if (shortBeatmapMatch) {
+      beatmapIdsToResolve.add(shortBeatmapMatch[1]);
+      continue;
+    }
+  }
+
+  return {
+    beatmapsetIds,
+    beatmapIdsToResolve
+  };
 }
 
-async function collectAllOsuLinksFromChannel(channel) {
-  const uniqueLinks = new Set();
+async function resolveBeatmapsetIdFromBeatmapId(beatmapId) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 8000);
+
+  try {
+    // `/b/<id>` typically redirects to `/beatmapsets/<setid>#osu/<id>`.
+    const response = await fetch(`https://osu.ppy.sh/b/${beatmapId}`, {
+      signal: controller.signal,
+      redirect: "follow"
+    });
+
+    const finalUrl = new URL(response.url);
+    const beatmapsetsMatch = finalUrl.pathname.match(/^\/beatmapsets\/(\d+)/i);
+    if (beatmapsetsMatch) {
+      return beatmapsetsMatch[1];
+    }
+
+    return null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function collectAllBeatmapsetIdsFromChannel(channel) {
+  const uniqueBeatmapsetIds = new Set();
+  const beatmapIdsToResolve = new Set();
   let beforeMessageId;
   let fetchedCount = 0;
 
@@ -56,9 +121,12 @@ async function collectAllOsuLinksFromChannel(channel) {
     fetchedCount += messages.size;
 
     for (const message of messages.values()) {
-      const links = extractOsuLinksFromText(message.content);
-      for (const link of links) {
-        uniqueLinks.add(link);
+      const extracted = extractOsuReferencesFromText(message.content);
+      for (const beatmapsetId of extracted.beatmapsetIds) {
+        uniqueBeatmapsetIds.add(beatmapsetId);
+      }
+      for (const beatmapId of extracted.beatmapIdsToResolve) {
+        beatmapIdsToResolve.add(beatmapId);
       }
     }
 
@@ -69,9 +137,22 @@ async function collectAllOsuLinksFromChannel(channel) {
     }
   }
 
+  let resolvedBeatmapIds = 0;
+  for (const beatmapId of beatmapIdsToResolve) {
+    const beatmapsetId = await resolveBeatmapsetIdFromBeatmapId(beatmapId);
+    if (!beatmapsetId) {
+      continue;
+    }
+
+    uniqueBeatmapsetIds.add(beatmapsetId);
+    resolvedBeatmapIds++;
+  }
+
   return {
-    uniqueLinks: Array.from(uniqueLinks),
-    scannedMessages: fetchedCount
+    uniqueBeatmapsetIds: Array.from(uniqueBeatmapsetIds),
+    scannedMessages: fetchedCount,
+    attemptedBeatmapIdResolves: beatmapIdsToResolve.size,
+    resolvedBeatmapIds
   };
 }
 
@@ -105,23 +186,28 @@ client.on("interactionCreate", async (interaction) => {
   }
 
   try {
-    const { uniqueLinks, scannedMessages } = await collectAllOsuLinksFromChannel(channel);
+    const {
+      uniqueBeatmapsetIds,
+      scannedMessages,
+      attemptedBeatmapIdResolves,
+      resolvedBeatmapIds
+    } = await collectAllBeatmapsetIdsFromChannel(channel);
 
-    if (uniqueLinks.length === 0) {
-      await interaction.editReply(`Scanned ${scannedMessages} messages but found no osu links.`);
+    if (uniqueBeatmapsetIds.length === 0) {
+      await interaction.editReply(`Scanned ${scannedMessages} messages but found no beatmapset IDs.`);
       return;
     }
 
-    const sortedLinks = uniqueLinks.sort((a, b) => a.localeCompare(b));
-    const fileContent = sortedLinks.join("\n");
+    const sortedBeatmapsetIds = uniqueBeatmapsetIds.sort((a, b) => Number(a) - Number(b));
+    const fileContent = sortedBeatmapsetIds.join("\n");
     const fileBuffer = Buffer.from(fileContent, "utf-8");
 
     const attachment = new AttachmentBuilder(fileBuffer, {
-      name: "osu_links_deduplicated.txt"
+      name: "osu_beatmapset_ids_deduplicated.txt"
     });
 
     await interaction.editReply({
-      content: `Done. Scanned ${scannedMessages} messages and found ${sortedLinks.length} unique osu links.`,
+      content: `Done. Scanned ${scannedMessages} messages and found ${sortedBeatmapsetIds.length} unique beatmapset IDs. Resolved ${resolvedBeatmapIds}/${attemptedBeatmapIdResolves} beatmap ID-only links.`,
       files: [attachment]
     });
   } catch (error) {
